@@ -1,0 +1,62 @@
+# Paper Harvester - Git Ignore
+
+# Environment variables (contains sensitive info)
+.env
+
+# Data directory (contains downloaded PDFs and database)
+data/
+!data/.gitkeep
+
+# Local merged journal catalog; share the split journal lists instead
+期刊列表分组/期刊列表_260511_zpc.xlsx
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Test coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Temporary files
+*.tmp
+*.temp

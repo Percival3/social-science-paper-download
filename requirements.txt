@@ -1,0 +1,33 @@
+# Paper Harvester - Sci-Hub Edition
+# Python dependencies
+
+# CLI framework
+click>=8.1.0
+
+# HTTP requests (with async support)
+httpx>=0.25.0
+
+# HTML parsing
+beautifulsoup4>=4.12.0
+
+# Excel reading
+pandas>=2.0.0
+openpyxl>=3.1.0
+
+# Progress bars
+tqdm>=4.66.0
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# PDF text extraction
+pymupdf>=1.23.0
+
+# Data validation
+pydantic>=2.5.0
+
+# Retry logic
+tenacity>=8.2.0
+
+# Type hints (for older Python)
+typing-extensions>=4.8.0;python_version<"3.10"
