@@ -2,9 +2,10 @@
 PDF storage path and code generation rules.
 """
 import html
+import json
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Any, Iterable, Optional
 
 from .database import Database, Journal, Paper
 
@@ -37,6 +38,11 @@ NON_DOWNLOAD_MAIN_TITLES = {
     "preface",
     "references",
     "table of contents",
+}
+NON_DOWNLOAD_METADATA_TYPES = {
+    "book review",
+    "book-review",
+    "book_review",
 }
 
 
@@ -99,6 +105,103 @@ def is_non_downloadable_title(value: Optional[str]) -> bool:
     )
 
 
+def _page_count(value: Optional[str]) -> Optional[int]:
+    """Return an approximate inclusive page count for Arabic page ranges."""
+    if not value:
+        return None
+
+    text = str(value)
+    numbers = [int(match.group(0)) for match in re.finditer(r"\d+", text)]
+    if not numbers:
+        return None
+
+    first = numbers[0]
+    last = numbers[-1]
+    if last < first:
+        return None
+
+    return last - first + 1
+
+
+def _metadata_values(value: Any) -> Iterable[str]:
+    """Yield string values from nested Crossref metadata structures."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for nested in value.values():
+            yield from _metadata_values(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from _metadata_values(nested)
+
+
+def _metadata_declares_non_downloadable(paper: Paper) -> bool:
+    """Use explicit publisher/Crossref type metadata when it exists."""
+    raw = paper.crossref_raw
+    if not raw:
+        return False
+
+    try:
+        metadata = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return False
+
+    direct_type_values = [
+        metadata.get("type"),
+        metadata.get("subtype"),
+        metadata.get("article-type"),
+        metadata.get("genre"),
+    ]
+    for value in direct_type_values:
+        if isinstance(value, str) and value.strip().casefold() in NON_DOWNLOAD_METADATA_TYPES:
+            return True
+
+    for assertion in metadata.get("assertion", []) or []:
+        values = " ".join(_metadata_values(assertion)).casefold()
+        if any(kind in values for kind in NON_DOWNLOAD_METADATA_TYPES):
+            return True
+
+    return False
+
+
+def _looks_like_book_review_title(value: Optional[str], pages: Optional[str]) -> bool:
+    """Conservatively detect bibliographic book-review titles."""
+    if not value:
+        return False
+
+    text = html.unescape(str(value).strip())
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return False
+
+    byline_pattern = re.compile(r"\b(?:By|Edited by|Translated by)\s+[A-Z]")
+    publication_pattern = re.compile(r":\s*.{2,220},\s*(?:19|20)\d{2}\.")
+    page_count_pattern = re.compile(r"\b\d+\s*p\.", re.IGNORECASE)
+    price_pattern = re.compile(r"(?:\$\s*\d|\bcloth\b|\bpaper\b)", re.IGNORECASE)
+
+    has_bibliographic_shape = (
+        bool(byline_pattern.search(text))
+        and bool(publication_pattern.search(text))
+        and bool(page_count_pattern.search(text))
+        and bool(price_pattern.search(text))
+    )
+    if not has_bibliographic_shape:
+        return False
+
+    count = _page_count(pages)
+    return count is None or count <= 5
+
+
+def is_non_downloadable_paper(paper: Paper) -> bool:
+    """Return whether a paper record should be skipped before PDF download."""
+    return (
+        is_non_downloadable_title(paper.title)
+        or _metadata_declares_non_downloadable(paper)
+        or _looks_like_book_review_title(paper.title, paper.pages)
+    )
+
+
 def journal_code(db: Database, journal_id: Optional[str]) -> str:
     """Return the three-digit journal code from the merged journal-list ID."""
     if not journal_id:
@@ -141,11 +244,12 @@ def issue_paper_id(db: Database, paper: Paper) -> str:
 def paper_code(db: Database, paper: Paper) -> str:
     """
     Build the PDF filename code:
-    journal source ID(3) + volume(4) + issue(3).
+    journal source ID(3) + year(4) + volume(4) + issue(3).
     """
+    year = numeric_code(paper.published_year, 4)
     volume = numeric_code(paper.volume, 4)
     issue = numeric_code(paper.issue, 3)
-    return f"{journal_code(db, paper.journal_id)}{volume}{issue}"
+    return f"{journal_code(db, paper.journal_id)}{year}{volume}{issue}"
 
 
 def journal_folder(db: Database, paper: Paper) -> str:
@@ -165,3 +269,28 @@ def build_pdf_path(db: Database, pdf_dir: Path, paper: Paper) -> Path:
         / issue
         / f"{paper_code(db, paper)}_{main_title(paper.title)}.pdf"
     )
+
+
+def suffixed_pdf_path(base_path: Path, suffix: int) -> Path:
+    """Return a numbered filename variant for a colliding PDF path."""
+    if suffix <= 1:
+        return base_path
+
+    return base_path.with_name(f"{base_path.stem}_{suffix:02d}{base_path.suffix}")
+
+
+def path_identity_key(data_dir: Path, file_path: Path | str) -> str:
+    """Return a case-insensitive absolute key for comparing stored paths."""
+    data_dir = data_dir.resolve(strict=False)
+    path = Path(file_path)
+    if path.is_absolute():
+        absolute_path = path
+    else:
+        cwd_relative_path = path.resolve(strict=False)
+        try:
+            cwd_relative_path.relative_to(data_dir)
+            absolute_path = cwd_relative_path
+        except ValueError:
+            absolute_path = data_dir / path
+
+    return str(absolute_path.resolve(strict=False)).casefold()

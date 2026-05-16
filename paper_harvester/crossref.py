@@ -383,12 +383,16 @@ def discover_papers_for_journal(
         until_year=until_year,
         journal_title=journal.title if not issn and not non_journal_rule else None,
     )
+    # Crossref's type filter keeps regular journal discovery away from
+    # non-journal works, but publisher book reviews may still be registered as
+    # journal-article and must be handled by the download classification layer.
+    work_type = non_journal_rule.get("type") if non_journal_rule else "journal-article"
     filters = build_crossref_filters(
         issn=issn,
         from_year=from_year,
         until_year=until_year,
         doi_prefix=non_journal_rule.get("prefix") if non_journal_rule else None,
-        work_type=non_journal_rule.get("type") if non_journal_rule else None,
+        work_type=work_type,
     )
     expected_journal_title = None if issn or non_journal_rule else journal.title
     

@@ -261,6 +261,14 @@ class Database:
         data = dict(row)
         data.pop("row_number", None)
         return Download(**data)
+
+    @staticmethod
+    def _normalize_download_for_current_state(download: Download) -> None:
+        """Keep file ownership only on successful current-state rows."""
+        if download.status != "success":
+            download.file_path = None
+            download.file_size = None
+            download.sha256 = None
     
     # =========================================================================
     # Journal Operations
@@ -432,68 +440,102 @@ class Database:
     # =========================================================================
     
     def insert_download(self, download: Download) -> int:
-        """Insert a download record and return its ID."""
+        """Upsert the current download state for a DOI and return its row ID."""
+        self._normalize_download_for_current_state(download)
+
         with self._get_connection() as conn:
-            cursor = conn.execute("""
-                INSERT INTO downloads
-                (doi, file_path, file_size, sha256, mirror, scihub_url, pdf_url,
-                 status, http_status, error_message, attempts, started_at, completed_at, response_time_ms)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                download.doi,
-                download.file_path,
-                download.file_size,
-                download.sha256,
-                download.mirror,
-                download.scihub_url,
-                download.pdf_url,
-                download.status,
-                download.http_status,
-                download.error_message,
-                download.attempts,
-                download.started_at,
-                download.completed_at,
-                download.response_time_ms,
-            ))
+            existing_id = None
+            if download.doi:
+                row = conn.execute(
+                    """
+                    SELECT download_id FROM downloads
+                    WHERE doi = ?
+                    ORDER BY COALESCE(completed_at, started_at) DESC, download_id DESC
+                    LIMIT 1
+                    """,
+                    (download.doi,),
+                ).fetchone()
+                existing_id = row["download_id"] if row else None
+
+            if existing_id is not None:
+                download.download_id = existing_id
+                self._update_download_in_connection(conn, download)
+                conn.execute(
+                    "DELETE FROM downloads WHERE doi = ? AND download_id != ?",
+                    (download.doi, existing_id),
+                )
+                return existing_id
+
+            cursor = self._insert_download_in_connection(conn, download)
             return cursor.lastrowid
+
+    def _insert_download_in_connection(self, conn: sqlite3.Connection, download: Download):
+        """Insert a download row using an existing connection."""
+        return conn.execute("""
+            INSERT INTO downloads
+            (doi, file_path, file_size, sha256, mirror, scihub_url, pdf_url,
+             status, http_status, error_message, attempts, started_at, completed_at, response_time_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            download.doi,
+            download.file_path,
+            download.file_size,
+            download.sha256,
+            download.mirror,
+            download.scihub_url,
+            download.pdf_url,
+            download.status,
+            download.http_status,
+            download.error_message,
+            download.attempts,
+            download.started_at,
+            download.completed_at,
+            download.response_time_ms,
+        ))
+
+    def _update_download_in_connection(self, conn: sqlite3.Connection, download: Download) -> None:
+        """Update a download row using an existing connection."""
+        conn.execute("""
+            UPDATE downloads SET
+                doi = ?,
+                file_path = ?,
+                file_size = ?,
+                sha256 = ?,
+                mirror = ?,
+                scihub_url = ?,
+                pdf_url = ?,
+                status = ?,
+                http_status = ?,
+                error_message = ?,
+                attempts = ?,
+                started_at = ?,
+                completed_at = ?,
+                response_time_ms = ?
+            WHERE download_id = ?
+        """, (
+            download.doi,
+            download.file_path,
+            download.file_size,
+            download.sha256,
+            download.mirror,
+            download.scihub_url,
+            download.pdf_url,
+            download.status,
+            download.http_status,
+            download.error_message,
+            download.attempts,
+            download.started_at,
+            download.completed_at,
+            download.response_time_ms,
+            download.download_id,
+        ))
     
     def update_download(self, download: Download) -> None:
         """Update a download record."""
+        self._normalize_download_for_current_state(download)
+
         with self._get_connection() as conn:
-            conn.execute("""
-                UPDATE downloads SET
-                    doi = ?,
-                    file_path = ?,
-                    file_size = ?,
-                    sha256 = ?,
-                    mirror = ?,
-                    scihub_url = ?,
-                    pdf_url = ?,
-                    status = ?,
-                    http_status = ?,
-                    error_message = ?,
-                    attempts = ?,
-                    started_at = ?,
-                    completed_at = ?,
-                    response_time_ms = ?
-                WHERE download_id = ?
-            """, (
-                download.doi,
-                download.file_path,
-                download.file_size,
-                download.sha256,
-                download.mirror,
-                download.scihub_url,
-                download.pdf_url,
-                download.status,
-                download.http_status,
-                download.error_message,
-                download.attempts,
-                download.started_at,
-                download.completed_at,
-                download.response_time_ms,
-                download.download_id,
-            ))
+            self._update_download_in_connection(conn, download)
     
     def get_download(self, download_id: int) -> Optional[Download]:
         """Get a download by ID."""
@@ -601,11 +643,23 @@ class Database:
         journal_id: Optional[str] = None,
         limit: Optional[int] = None,
     ) -> List[Tuple[Download, Paper]]:
-        """List downloads with optional filters, joined with papers."""
+        """List current download states with optional filters, joined with papers."""
         query = """
             SELECT d.*, p.* FROM downloads d
             LEFT JOIN papers p ON d.doi = p.doi
-            WHERE 1=1
+            WHERE d.download_id IN (
+                SELECT download_id FROM (
+                    SELECT
+                        download_id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY doi
+                            ORDER BY COALESCE(completed_at, started_at) DESC, download_id DESC
+                        ) AS row_number
+                    FROM downloads
+                    WHERE doi IS NOT NULL
+                )
+                WHERE row_number = 1
+            )
         """
         params = []
         
@@ -644,7 +698,19 @@ class Database:
             if journal_id:
                 rows = conn.execute("""
                     SELECT d.status, COUNT(*) as count
-                    FROM downloads d
+                    FROM (
+                        SELECT * FROM (
+                            SELECT
+                                d.*,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY d.doi
+                                    ORDER BY COALESCE(d.completed_at, d.started_at) DESC, d.download_id DESC
+                                ) AS row_number
+                            FROM downloads d
+                            WHERE d.doi IS NOT NULL
+                        )
+                        WHERE row_number = 1
+                    ) d
                     JOIN papers p ON d.doi = p.doi
                     WHERE p.journal_id = ?
                     GROUP BY d.status
@@ -652,7 +718,19 @@ class Database:
             else:
                 rows = conn.execute("""
                     SELECT status, COUNT(*) as count
-                    FROM downloads
+                    FROM (
+                        SELECT * FROM (
+                            SELECT
+                                d.*,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY d.doi
+                                    ORDER BY COALESCE(d.completed_at, d.started_at) DESC, d.download_id DESC
+                                ) AS row_number
+                            FROM downloads d
+                            WHERE d.doi IS NOT NULL
+                        )
+                        WHERE row_number = 1
+                    )
                     GROUP BY status
                 """).fetchall()
             

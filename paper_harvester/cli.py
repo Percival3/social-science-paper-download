@@ -26,6 +26,7 @@ from .reports import (
     retry_failed_downloads,
     verify_downloads,
     migrate_pdf_paths,
+    cleanup_non_paper_downloads,
 )
 
 
@@ -630,6 +631,55 @@ def migrate_paths(ctx, apply_changes, output_path):
     click.echo(f"⚠ Unresolved: {summary['unresolved']}")
 
 
+@cli.command('cleanup-non-papers')
+@click.option('--apply', 'apply_changes', is_flag=True, help='Apply database changes and quarantine PDFs')
+@click.option('--output', '-o', 'output_path', help='Output JSON manifest path')
+@click.option(
+    '--quarantine-dir',
+    type=click.Path(file_okay=False),
+    help='Directory for quarantined PDFs (defaults to DATA_DIR/fulltext/quarantine/non_papers)',
+)
+@click.pass_context
+def cleanup_non_papers(ctx, apply_changes, output_path, quarantine_dir):
+    """Mark current non-paper downloads as skipped and quarantine their PDFs."""
+    db, config = get_db_and_config(ctx)
+
+    if output_path:
+        manifest_path = Path(output_path)
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        manifest_path = config.manifests_dir / f"non_paper_cleanup_{timestamp}.json"
+
+    quarantine_path = (
+        Path(quarantine_dir)
+        if quarantine_dir
+        else config.data_dir / "fulltext" / "quarantine" / "non_papers"
+    )
+
+    if apply_changes:
+        click.echo("Applying non-paper cleanup...")
+    else:
+        click.echo("DRY RUN - no files or database rows will be changed")
+
+    manifest = cleanup_non_paper_downloads(
+        db=db,
+        data_dir=config.data_dir,
+        quarantine_dir=quarantine_path,
+        manifest_path=manifest_path,
+        apply=apply_changes,
+    )
+
+    summary = manifest["summary"]
+    click.echo(f"✓ Manifest: {manifest_path}")
+    click.echo(f"✓ Candidates: {summary['candidates']}")
+    click.echo(f"✓ Marked skipped: {summary['marked_skipped']}")
+    click.echo(f"✓ Quarantined: {summary['quarantined']}")
+    click.echo(f"⚠ Missing/no path: {summary['missing']}")
+    click.echo(f"⚠ Shared with downloadable: {summary['shared_with_downloadable']}")
+    click.echo(f"⚠ Conflicts: {summary['conflict']}")
+    click.echo(f"⚠ Unresolved: {summary['unresolved']}")
+
+
 @cli.command()
 @click.option('--limit', '-l', type=int, default=50, help='Maximum to retry')
 @click.pass_context
@@ -648,16 +698,36 @@ def retry_failed(ctx, limit):
 
 
 @cli.command()
+@click.option('--apply', 'apply_changes', is_flag=True, help='Update stale database paths and compact current download state')
+@click.option('--archive-dir', type=click.Path(exists=True, file_okay=False), help='Offline/archive PDF directory to reconcile moved files')
 @click.pass_context
-def verify(ctx):
+def verify(ctx, apply_changes, archive_dir):
     """Verify all downloaded files."""
     db, config = get_db_and_config(ctx)
     
-    click.echo("Verifying downloaded files...")
+    if apply_changes:
+        click.echo("Verifying downloaded files and updating database state...")
+    else:
+        click.echo("Verifying downloaded files...")
     
-    stats = verify_downloads(db, config.pdf_dir)
+    stats = verify_downloads(
+        db,
+        config.pdf_dir,
+        apply=apply_changes,
+        archive_dir=Path(archive_dir) if archive_dir else None,
+    )
     
     click.echo(f"\n✓ Valid: {stats['valid']}")
+    if stats.get('archive_found'):
+        click.echo(f"✓ Found in archive: {stats['archive_found']}")
+    if stats.get('paths_updated'):
+        click.echo(f"✓ Paths updated: {stats['paths_updated']}")
+    if stats.get('non_success_paths_cleared'):
+        label = "cleared" if apply_changes else "to clear"
+        click.echo(f"✓ Non-success file paths {label}: {stats['non_success_paths_cleared']}")
+    if stats.get('historical_rows_removed'):
+        label = "removed" if apply_changes else "to remove"
+        click.echo(f"✓ Historical download rows {label}: {stats['historical_rows_removed']}")
     click.echo(f"✗ Corrupt: {stats['corrupt']}")
     click.echo(f"✗ Missing: {stats['missing']}")
 

@@ -12,12 +12,13 @@ from typing import Dict, Any, Optional, List
 from tqdm import tqdm
 
 from .database import Database, Download, Paper
-from .paths import build_pdf_path
+from .paths import build_pdf_path, is_non_downloadable_paper
 from .scihub import SciHubClient
 
 
 FILE_EXISTS_SKIPPED = "File already exists (skipped)"
 COLLISION_INVALIDATED_ERROR = "path collision invalidated; redownload required"
+NON_PAPER_CLEANUP_ERROR = "Skipped non-paper title"
 
 
 def _format_timestamp(value) -> str:
@@ -368,6 +369,277 @@ def _invalidate_success_records_for_path(
     return invalidated_ids
 
 
+def _clear_non_success_file_paths_for_path(
+    db: Database,
+    old_file_path: str,
+    apply: bool,
+) -> List[int]:
+    """Clear stale file ownership from skipped/failed rows for one path."""
+    cleared_ids: List[int] = []
+    for record in db.list_downloads_by_file_path(old_file_path):
+        if record.status == "success":
+            continue
+
+        cleared_ids.append(record.download_id)
+        if apply:
+            record.file_path = None
+            record.file_size = None
+            record.sha256 = None
+            db.update_download(record)
+
+    return cleared_ids
+
+
+def _mark_success_records_as_non_paper_skipped(
+    db: Database,
+    doi: str,
+    apply: bool,
+) -> List[int]:
+    """Mark all successful rows for one DOI as skipped by current non-paper rules."""
+    updated_ids: List[int] = []
+    now = datetime.now()
+
+    for record in db.list_downloads_for_doi(doi, status="success"):
+        updated_ids.append(record.download_id)
+        if apply:
+            record.status = "skipped"
+            record.file_path = None
+            record.file_size = None
+            record.sha256 = None
+            record.completed_at = now
+            record.error_message = NON_PAPER_CLEANUP_ERROR
+            db.update_download(record)
+
+    return updated_ids
+
+
+def _quarantine_target_path(
+    data_dir: Path,
+    quarantine_dir: Path,
+    old_file_path: str,
+    source_path: Path,
+) -> Path:
+    """Build a quarantine path while preserving managed relative paths."""
+    path = Path(old_file_path)
+    if path.is_absolute():
+        try:
+            return quarantine_dir / path.relative_to(data_dir)
+        except ValueError:
+            return quarantine_dir / path.name
+    return quarantine_dir / path
+
+
+def cleanup_non_paper_downloads(
+    db: Database,
+    data_dir: Path,
+    quarantine_dir: Path,
+    manifest_path: Path,
+    apply: bool = False,
+) -> Dict[str, Any]:
+    """
+    Quarantine PDFs whose current metadata rules classify them as non-papers.
+
+    Dry-run mode writes the same manifest without moving files or updating rows.
+    """
+    manifest: Dict[str, Any] = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "mode": "apply" if apply else "dry-run",
+        "data_dir": str(data_dir),
+        "quarantine_dir": str(quarantine_dir),
+        "summary": {
+            "candidates": 0,
+            "marked_skipped": 0,
+            "quarantined": 0,
+            "missing": 0,
+            "shared_with_downloadable": 0,
+            "conflict": 0,
+            "unresolved": 0,
+        },
+        "marked_skipped": [],
+        "quarantined": [],
+        "missing": [],
+        "shared_with_downloadable": [],
+        "conflict": [],
+        "unresolved": [],
+    }
+
+    path_groups: Dict[Optional[str], List[tuple[Download, Paper]]] = {}
+    seen_dois = set()
+
+    for download in db.list_latest_downloads(status="success"):
+        if not download.doi:
+            _append_manifest(
+                manifest,
+                "unresolved",
+                {
+                    "reason": "Download record has no DOI",
+                    "download": _download_manifest_entry(download, Paper(doi="")),
+                },
+            )
+            continue
+
+        paper = db.get_paper(download.doi) or Paper(doi=download.doi)
+        if not is_non_downloadable_paper(paper):
+            continue
+
+        if download.doi in seen_dois:
+            continue
+        seen_dois.add(download.doi)
+        manifest["summary"]["candidates"] += 1
+        path_groups.setdefault(download.file_path, []).append((download, paper))
+
+    for old_file_path, records in sorted(
+        path_groups.items(),
+        key=lambda item: item[0] or "",
+    ):
+        if not old_file_path:
+            for download, paper in records:
+                updated_ids = _mark_success_records_as_non_paper_skipped(
+                    db,
+                    paper.doi,
+                    apply,
+                )
+                _append_manifest(
+                    manifest,
+                    "missing",
+                    {
+                        "reason": "Download record has no file path",
+                        "updated_download_ids": updated_ids,
+                        "download": _download_manifest_entry(download, paper),
+                    },
+                )
+                _append_manifest(
+                    manifest,
+                    "marked_skipped",
+                    {
+                        "reason": NON_PAPER_CLEANUP_ERROR,
+                        "old_file_path": old_file_path,
+                        "updated_download_ids": updated_ids,
+                        "download": _download_manifest_entry(download, paper),
+                    },
+                )
+            continue
+
+        source_path = _resolve_download_path(data_dir, old_file_path)
+        shared_records: List[tuple[Download, Paper]] = []
+        for shared_download in db.list_downloads_by_file_path(old_file_path, status="success"):
+            if not shared_download.doi:
+                continue
+            shared_paper = db.get_paper(shared_download.doi) or Paper(doi=shared_download.doi)
+            if not is_non_downloadable_paper(shared_paper):
+                shared_records.append((shared_download, shared_paper))
+
+        if shared_records:
+            _append_manifest(
+                manifest,
+                "shared_with_downloadable",
+                {
+                    "reason": "Source PDF is also referenced by downloadable paper records",
+                    "old_file_path": old_file_path,
+                    "source_path": str(source_path),
+                    "downloadable_records": [
+                        _download_manifest_entry(download, paper)
+                        for download, paper in shared_records
+                    ],
+                    "non_paper_records": [
+                        _download_manifest_entry(download, paper)
+                        for download, paper in records
+                    ],
+                },
+            )
+        elif not source_path.exists() or not source_path.is_file():
+            _append_manifest(
+                manifest,
+                "missing",
+                {
+                    "reason": "Source PDF is missing",
+                    "old_file_path": old_file_path,
+                    "source_path": str(source_path),
+                    "downloads": [
+                        _download_manifest_entry(download, paper)
+                        for download, paper in records
+                    ],
+                },
+            )
+        else:
+            target_path = _quarantine_target_path(
+                data_dir,
+                quarantine_dir,
+                old_file_path,
+                source_path,
+            )
+            source_size, source_sha256 = _file_metadata(source_path)
+
+            if target_path.exists():
+                target_size, target_sha256 = _file_metadata(target_path)
+                if target_sha256.lower() != source_sha256.lower():
+                    _append_manifest(
+                        manifest,
+                        "conflict",
+                        {
+                            "reason": "Quarantine target exists with different SHA256",
+                            "old_file_path": old_file_path,
+                            "source_path": str(source_path),
+                            "quarantine_path": str(target_path),
+                            "source_size": source_size,
+                            "source_sha256": source_sha256,
+                            "target_size": target_size,
+                            "target_sha256": target_sha256,
+                            "downloads": [
+                                _download_manifest_entry(download, paper)
+                                for download, paper in records
+                            ],
+                        },
+                    )
+                    continue
+
+            if apply:
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                if target_path.exists():
+                    source_path.unlink(missing_ok=True)
+                else:
+                    shutil.move(str(source_path), str(target_path))
+
+            _append_manifest(
+                manifest,
+                "quarantined",
+                {
+                    "old_file_path": old_file_path,
+                    "source_path": str(source_path),
+                    "quarantine_path": str(target_path),
+                    "source_size": source_size,
+                    "source_sha256": source_sha256,
+                    "downloads": [
+                        _download_manifest_entry(download, paper)
+                        for download, paper in records
+                    ],
+                },
+            )
+
+        for download, paper in records:
+            updated_ids = _mark_success_records_as_non_paper_skipped(
+                db,
+                paper.doi,
+                apply,
+            )
+            _append_manifest(
+                manifest,
+                "marked_skipped",
+                {
+                    "reason": NON_PAPER_CLEANUP_ERROR,
+                    "old_file_path": old_file_path,
+                    "updated_download_ids": updated_ids,
+                    "download": _download_manifest_entry(download, paper),
+                },
+            )
+
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+    return manifest
+
+
 def migrate_pdf_paths(
     db: Database,
     data_dir: Path,
@@ -545,6 +817,14 @@ def migrate_pdf_paths(
                     },
                 )
 
+            cleared_ids = _clear_non_success_file_paths_for_path(
+                db,
+                old_file_path,
+                apply,
+            )
+            if moved_entry is not None:
+                moved_entry["cleared_non_success_download_ids"] = cleared_ids
+
             for download, paper in records:
                 if download.download_id == owner_download.download_id:
                     continue
@@ -569,7 +849,7 @@ def migrate_pdf_paths(
             if (
                 apply
                 and moved_entry is not None
-                and not db.list_downloads_by_file_path(old_file_path)
+                and not db.list_downloads_by_file_path(old_file_path, status="success")
             ):
                 source_path.unlink(missing_ok=True)
                 moved_entry["removed_source"] = True
@@ -647,31 +927,147 @@ def retry_failed_downloads(
     return stats
 
 
-def verify_downloads(db: Database, pdf_dir: Path) -> Dict[str, int]:
+def _pdf_header_is_valid(file_path: Path) -> bool:
+    """Return whether a file starts with a PDF header."""
+    with open(file_path, 'rb') as f:
+        return f.read(4) == b'%PDF'
+
+
+def _build_archive_index(archive_dir: Optional[Path]) -> tuple[Dict[str, Path], Dict[str, Path]]:
+    """Index archived PDFs by SHA256 and filename."""
+    by_sha256: Dict[str, Path] = {}
+    by_name: Dict[str, Path] = {}
+
+    if not archive_dir or not archive_dir.exists():
+        return by_sha256, by_name
+
+    for file_path in archive_dir.rglob("*.pdf"):
+        if not file_path.is_file():
+            continue
+
+        by_name.setdefault(file_path.name.casefold(), file_path)
+        try:
+            by_sha256.setdefault(_calculate_file_sha256(file_path).lower(), file_path)
+        except OSError:
+            continue
+
+    return by_sha256, by_name
+
+
+def _find_archived_pdf(
+    download: Download,
+    archive_by_sha256: Dict[str, Path],
+    archive_by_name: Dict[str, Path],
+) -> Optional[Path]:
+    """Find an archived PDF for a download by hash first, then filename."""
+    if download.sha256:
+        match = archive_by_sha256.get(download.sha256.lower())
+        if match:
+            return match
+
+    if download.file_path:
+        return archive_by_name.get(Path(download.file_path).name.casefold())
+
+    return None
+
+
+def _compact_download_rows(db: Database, apply: bool) -> int:
+    """Delete historical download rows, keeping the latest row for each DOI."""
+    with db._get_connection() as conn:
+        rows = conn.execute("""
+            SELECT download_id FROM (
+                SELECT
+                    download_id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY doi
+                        ORDER BY COALESCE(completed_at, started_at) DESC, download_id DESC
+                    ) AS row_number
+                FROM downloads
+                WHERE doi IS NOT NULL
+            )
+            WHERE row_number > 1
+        """).fetchall()
+        stale_ids = [row["download_id"] for row in rows]
+
+        if apply and stale_ids:
+            placeholders = ",".join("?" for _ in stale_ids)
+            conn.execute(
+                f"DELETE FROM downloads WHERE download_id IN ({placeholders})",
+                stale_ids,
+            )
+
+    return len(stale_ids)
+
+
+def _clear_non_success_file_paths(db: Database, apply: bool) -> int:
+    """Clear stale file paths from skipped/failed/pending current-state rows."""
+    downloads = db.list_latest_downloads()
+    count = 0
+    for download in downloads:
+        if download.status == "success" or not download.file_path:
+            continue
+
+        count += 1
+        if apply:
+            download.file_path = None
+            download.file_size = None
+            download.sha256 = None
+            db.update_download(download)
+
+    return count
+
+
+def verify_downloads(
+    db: Database,
+    pdf_dir: Path,
+    apply: bool = False,
+    archive_dir: Optional[Path] = None,
+) -> Dict[str, int]:
     """
     Verify downloaded files against database records.
     
     Args:
         db: Database instance
         pdf_dir: PDF directory
+        apply: If True, update stale database paths and compact download rows
+        archive_dir: Optional offline/archive PDF directory to reconcile paths
         
     Returns:
         Statistics dictionary
     """
+    data_dir = pdf_dir.parent.parent
+    archive_by_sha256, archive_by_name = _build_archive_index(archive_dir)
     downloads = db.list_downloads(status='success', limit=100000)
     
     stats = {
         'valid': 0,
         'corrupt': 0,
         'missing': 0,
+        'archive_found': 0,
+        'paths_updated': 0,
+        'non_success_paths_cleared': _clear_non_success_file_paths(db, apply),
+        'historical_rows_removed': _compact_download_rows(db, apply),
     }
     
     for download, paper in tqdm(downloads, desc="Verifying"):
         if not download.file_path:
+            stats['missing'] += 1
             continue
         
-        file_path = pdf_dir.parent.parent / download.file_path
+        file_path = _resolve_download_path(data_dir, download.file_path)
+        archived_path: Optional[Path] = None
         
+        if not file_path.exists():
+            archived_path = _find_archived_pdf(download, archive_by_sha256, archive_by_name)
+            if archived_path:
+                stats['archive_found'] += 1
+                file_path = archived_path
+            else:
+                # Missing success files are reported, but not marked failed here:
+                # an offline drive may simply not be attached.
+                stats['missing'] += 1
+                continue
+
         if not file_path.exists():
             stats['missing'] += 1
             continue
@@ -694,11 +1090,14 @@ def verify_downloads(db: Database, pdf_dir: Path) -> Dict[str, int]:
                 continue
         
         # Check PDF header
-        with open(file_path, 'rb') as f:
-            header = f.read(4)
-            if header != b'%PDF':
-                stats['corrupt'] += 1
-                continue
+        if not _pdf_header_is_valid(file_path):
+            stats['corrupt'] += 1
+            continue
+
+        if archived_path and apply:
+            download.file_path = _relative_to_data_dir(data_dir, archived_path)
+            db.update_download(download)
+            stats['paths_updated'] += 1
         
         stats['valid'] += 1
     

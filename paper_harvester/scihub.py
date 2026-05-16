@@ -6,7 +6,7 @@ import re
 import shutil
 import subprocess
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -17,7 +17,12 @@ from bs4 import BeautifulSoup
 
 from .config import Config
 from .database import Database, Mirror, Download, Paper
-from .paths import build_pdf_path, is_non_downloadable_title
+from .paths import (
+    build_pdf_path,
+    is_non_downloadable_paper,
+    path_identity_key,
+    suffixed_pdf_path,
+)
 
 
 # Sci-Hub PDF extraction patterns
@@ -34,7 +39,7 @@ PDF_PATTERNS = [
     re.compile(r'href=["\']([^"\']+\.pdf[^"\']*)["\']', re.IGNORECASE),
 ]
 
-NBER_WORKING_PAPER_DOI = re.compile(r"^10\.3386/(w\d+)$", re.IGNORECASE)
+NBER_PAPER_DOI = re.compile(r"^10\.3386/([wth]\d+)$", re.IGNORECASE)
 NON_PAPER_SKIP_ERROR = "Skipped non-paper title"
 DUPLICATE_TARGET_SKIP_ERROR = "Skipped duplicate target path"
 
@@ -119,7 +124,7 @@ def _download_record_matches_local_file(download: Download, data_dir: Path) -> T
 def official_pdf_source_for_doi(doi: str) -> Optional[Dict[str, str]]:
     """Return official PDF source metadata for supported working-paper DOIs."""
     normalized_doi = doi.strip().lower()
-    nber_match = NBER_WORKING_PAPER_DOI.match(normalized_doi)
+    nber_match = NBER_PAPER_DOI.match(normalized_doi)
     if nber_match:
         paper_number = nber_match.group(1)
         page_url = f"https://www.nber.org/papers/{paper_number}"
@@ -130,6 +135,49 @@ def official_pdf_source_for_doi(doi: str) -> Optional[Dict[str, str]]:
         }
 
     return None
+
+
+def _success_path_owner_map(db: Database, data_dir: Path) -> Dict[str, set[str]]:
+    """Map each successful PDF path to the DOI(s) that currently own it."""
+    owners: Dict[str, set[str]] = defaultdict(set)
+    for file_path, downloads in db.list_latest_success_downloads_by_file_path().items():
+        key = path_identity_key(data_dir, file_path)
+        for download in downloads:
+            if download.doi:
+                owners[key].add(download.doi.lower())
+    return owners
+
+
+def _choose_collision_safe_output_path(
+    *,
+    data_dir: Path,
+    base_path: Path,
+    doi: str,
+    success_path_owners: Dict[str, set[str]],
+    force: bool,
+    max_suffix: int = 999,
+) -> tuple[Optional[Path], Optional[str]]:
+    """Choose a PDF path without overwriting a different DOI's successful file."""
+    doi_key = doi.lower()
+    base_key = path_identity_key(data_dir, base_path)
+    base_owners = success_path_owners.get(base_key, set())
+
+    if not base_owners and base_path.exists() and not force:
+        return None, f"Untracked target path already exists: {base_path.relative_to(data_dir)}"
+
+    for suffix in range(1, max_suffix + 1):
+        candidate = suffixed_pdf_path(base_path, suffix)
+        key = path_identity_key(data_dir, candidate)
+        owners = success_path_owners.get(key, set())
+        if any(owner != doi_key for owner in owners):
+            continue
+
+        if candidate.exists() and not owners and not force:
+            continue
+
+        return candidate, None
+
+    return None, f"No available numbered PDF path after _{max_suffix:02d}: {base_path.relative_to(data_dir)}"
 
 
 class SciHubClient:
@@ -821,6 +869,7 @@ def download_papers(
     volume_attempts: Counter = Counter()
     volume_successes: Counter = Counter()
     skipped_years = set()
+    success_path_owners = _success_path_owner_map(db, client.config.data_dir)
     
     for i, (doi, paper) in enumerate(entries):
         current_year_key = year_key(paper)
@@ -843,7 +892,7 @@ def download_papers(
                 progress_callback(i + 1, len(entries), doi, False, "skipped unavailable year")
             continue
 
-        if is_non_downloadable_title(paper.title):
+        if is_non_downloadable_paper(paper):
             now = datetime.now()
             stats['skipped'] += 1
             db.insert_download(
@@ -865,49 +914,33 @@ def download_papers(
                 progress_callback(i + 1, len(entries), doi, True, "skipped non-paper")
             continue
         
-        output_path = build_pdf_path(db, output_dir, paper)
-        force_existing_file = force
-        
-        # Check if already downloaded
+        # Current-state success means the DOI has already been acquired. File
+        # presence is verified separately by the verify command so offline
+        # archives/removable drives do not trigger accidental re-downloads.
         if not force:
             existing = db.get_download_by_doi(doi)
-            if existing and existing.status == 'success' and existing.sha256:
-                local_ok, local_message = _download_record_matches_local_file(
-                    existing,
-                    client.config.data_dir,
-                )
-                if local_ok:
-                    stats['skipped'] += 1
-                    volume_attempts[current_volume_key] += 1
-                    volume_successes[current_volume_key] += 1
-                    if progress_callback:
-                        progress_callback(i + 1, len(entries), doi, True, "skipped")
-                    continue
+            if existing and existing.status == 'success' and (existing.sha256 or existing.file_path):
+                stats['skipped'] += 1
+                volume_attempts[current_volume_key] += 1
+                volume_successes[current_volume_key] += 1
+                if progress_callback:
+                    progress_callback(i + 1, len(entries), doi, True, "skipped existing success")
+                continue
 
-                force_existing_file = True
-                db.insert_log(
-                    action='download',
-                    status='retry',
-                    doi=doi,
-                    message=f"Existing success record ignored: {local_message}",
-                )
-
-        relative_output_path = str(output_path.relative_to(client.config.data_dir))
-        success_records_for_path = db.list_downloads_by_file_path(
-            relative_output_path,
-            status='success',
+        base_output_path = build_pdf_path(db, output_dir, paper)
+        output_path, path_error = _choose_collision_safe_output_path(
+            data_dir=client.config.data_dir,
+            base_path=base_output_path,
+            doi=doi,
+            success_path_owners=success_path_owners,
+            force=force,
         )
-        conflicting_records = [
-            record for record in success_records_for_path
-            if (record.doi or "").lower() != doi.lower()
-        ]
-        if conflicting_records or (output_path.exists() and not force and not success_records_for_path):
+        if output_path is None:
             now = datetime.now()
             stats['skipped'] += 1
             db.insert_download(
                 Download(
                     doi=doi,
-                    file_path=relative_output_path if output_path.exists() else None,
                     status='skipped',
                     error_message=DUPLICATE_TARGET_SKIP_ERROR,
                     started_at=now,
@@ -918,7 +951,7 @@ def download_papers(
                 action='download',
                 status='skip',
                 doi=doi,
-                message=f"{DUPLICATE_TARGET_SKIP_ERROR}: {relative_output_path}",
+                message=f"{DUPLICATE_TARGET_SKIP_ERROR}: {path_error}",
             )
             if progress_callback:
                 progress_callback(i + 1, len(entries), doi, True, "skipped duplicate path")
@@ -929,7 +962,7 @@ def download_papers(
         result = client.download(
             doi,
             output_path,
-            force=force_existing_file,
+            force=force,
             preferred_mirror=preferred_mirror,
             official_only=official_only,
             skip_existing_file=False,
@@ -953,6 +986,8 @@ def download_papers(
         )
         
         download_id = db.insert_download(download)
+        if result.success and output_path.exists():
+            success_path_owners[path_identity_key(client.config.data_dir, output_path)].add(doi.lower())
         
         if result.success and result.error_message == "File already exists (skipped)":
             stats['skipped'] += 1

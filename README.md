@@ -74,9 +74,9 @@ data/
 
 - 原始全文和数据库不提交到 Git
 - PDF 按期刊、年份、期次分层保存，文件夹结构为 `{期刊全名}/{年份}/{issue三位}`，例如 `Journal of Finance/2024/001`
-- PDF 文件名使用 `{期刊ID三位}{volume四位}{issue三位}_{主标题}.pdf`，例如 `0750000000_The Effect of Unions on Employment.pdf`
+- PDF 文件名使用 `{期刊ID三位}{年份四位}{volume四位}{issue三位}_{主标题}.pdf`，例如 `07520200124001_The Effect of Unions on Employment.pdf`
 - 期刊 ID 来自合并后的 `期刊列表_260511_zpc.xlsx`，例如第 1 本为 `001`、第 10 本为 `010`
-- 如果 Crossref 元数据缺 volume 或 issue，分别用 `0000` / `000` 占位；超出固定位数时保留完整数字，不截断
+- 如果 Crossref 元数据缺年份、volume 或 issue，分别用 `0000` / `0000` / `000` 占位；超出固定位数时保留完整数字，不截断
 - `Book Review`、`Correction`、`Introduction`、`Front Matter`、`Index` 等非论文主标题会在下载前跳过并记录为 `skipped`
 - 下载记录保存 `doi`, `title`, `journal`, `year`, `mirror`, `url`, `sha256`, `retrieved_at`, `file_path`
 - 日志记录每次请求的 `timestamp`, `doi`, `mirror`, `status_code`, `response_time`
@@ -114,6 +114,12 @@ HTTPS_PROXY=
 ## 启动 Python 环境
 
 本项目需要 Python 3.10+。推荐每位使用者在自己的机器上创建独立虚拟环境，然后安装依赖和命令行入口。
+
+### 如果没有 conda
+
+不需要为了运行本项目专门安装 conda。只要本机已经安装 Python 3.10 或更高版本，就可以直接使用 Python 自带的 `venv` 创建虚拟环境，然后按下面「方式一」安装依赖。
+
+如果命令行里执行 `python --version` 或 `python3 --version` 找不到 Python，请先从 [Python 官网](https://www.python.org/downloads/) 安装 Python 3.10+。Windows 安装时建议勾选 **Add python.exe to PATH**；安装完成后重新打开 PowerShell，再执行下面的 `venv` 步骤。
 
 ### 方式一：使用 venv（推荐通用方式）
 
@@ -277,8 +283,8 @@ paper-harvester download --doi 10.3386/w15630 --official-only --force
 
 1. `SciHubClient.download()` 负责从 DOI 找到 PDF 直链；工作论文 DOI 会先尝试官方源。
 2. `SciHubClient._download_pdf()` 负责把 PDF 流式写入 `.part` 临时文件，校验大小和 `%PDF` 文件头后再保存为最终文件。
-3. `paper_harvester.paths.build_pdf_path()` 负责生成 `{期刊全名}/{年份}/{issue三位}/{CODE}_{主标题}.pdf` 保存路径。
-4. `download_papers()` 负责批量调度、写入 `downloads` 表；只有当前 DOI 的成功记录与本地文件哈希/大小匹配时才会跳过，单纯同名文件存在不会被当作该 DOI 成功；非论文主标题会直接跳过。
+3. `paper_harvester.paths.build_pdf_path()` 负责生成 `{期刊全名}/{年份}/{issue三位}/{CODE}_{主标题}.pdf` 保存路径，其中 `CODE` 为 `{期刊ID三位}{年份四位}{volume四位}{issue三位}`。
+4. `download_papers()` 负责批量调度、写入 `downloads` 表；同 DOI 已成功会跳过，不同 DOI 撞到同一基础文件名时会自动使用 `_02`、`_03` 等后缀保存；非论文主标题会直接跳过。
 
 后续替换为其他下载方式时，优先替换 `SciHubClient.download()` 内部逻辑，尽量保留 `download_papers()`、`build_pdf_path()`、SHA256 校验和数据库记录格式，这样 `status`、`queue`、`report`、`verify`、`extract-text` 可以继续复用。
 
@@ -325,7 +331,7 @@ paper-harvester import-files --input "D:\publisher_package" --journal-id journal
 paper-harvester import-files --input "D:\existing_papers" --force
 ```
 
-`import-files` 会根据数据库中已有论文的 DOI 匹配输入文件名，然后按统一规则复制到 `DATA_DIR/fulltext/pdf/{期刊全名}/{年份}/{issue}/{CODE}.pdf`，并在 `downloads` 表中写入 `local-file` 来源记录。无法匹配到已知 DOI 的 PDF 会被跳过。
+`import-files` 会根据数据库中已有论文的 DOI 匹配输入文件名，然后按统一规则复制到 `DATA_DIR/fulltext/pdf/{期刊全名}/{年份}/{issue}/{CODE}_{主标题}.pdf`，并在 `downloads` 表中写入 `local-file` 来源记录。无法匹配到已知 DOI 的 PDF 会被跳过。
 
 ### 生成报告
 
@@ -370,6 +376,12 @@ paper-harvester cleanup
 # 验证所有文件的哈希完整性
 paper-harvester verify
 
+# 核对并同步数据库状态：清理非 success 的旧文件路径、压缩历史下载行
+paper-harvester verify --apply
+
+# 如果 PDF 已经移动到 U 盘或归档目录，用归档目录重新登记路径
+paper-harvester verify --apply --archive-dir "E:\paper_harvester_pdf"
+
 # 重试失败的下载
 paper-harvester retry-failed --limit 50
 
@@ -385,6 +397,8 @@ paper-harvester extract-text --input data/fulltext/pdf --output data/fulltext/tx
 # 覆盖已有txt
 paper-harvester extract-text --force
 ```
+
+`verify` 默认只报告，不改数据库；`verify --apply` 才会更新数据库状态。找不到 success 文件时不会自动改成 failed，因为 PDF 可能只是被移动到离线硬盘或 U 盘；需要重新登记移动后的文件时使用 `--archive-dir`。
 
 `extract-text` 使用 PyMuPDF 读取 PDF，并在输出目录中保留相对路径结构，把 `.pdf` 转为同名 `.txt`。
 
@@ -426,17 +440,19 @@ paper-harvester extract-text --force
 
 ### `downloads`
 
+`downloads` 作为 DOI 的当前下载状态表使用；下载过程和跳过原因的历史细节写入 `logs`，同一 DOI 后续写入会更新当前状态。
+
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | download_id | INTEGER PK | 下载ID |
 | doi | TEXT FK | DOI |
-| file_path | TEXT | 本地文件相对路径 |
+| file_path | TEXT | 当前 PDF 文件路径；success 记录可为相对 DATA_DIR 路径或外部归档路径 |
 | file_size | INTEGER | 文件大小（字节） |
 | sha256 | TEXT | 文件SHA256哈希 |
 | mirror | TEXT | 使用的Sci-Hub镜像 |
 | scihub_url | TEXT | 请求的Sci-Hub页面URL |
 | pdf_url | TEXT | 实际PDF下载URL |
-| status | TEXT | 状态：success/failed/pending |
+| status | TEXT | 当前状态：success/failed/skipped/pending |
 | http_status | INTEGER | HTTP状态码 |
 | error_message | TEXT | 错误信息（如失败） |
 | attempts | INTEGER | 尝试次数 |
