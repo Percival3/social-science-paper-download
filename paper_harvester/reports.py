@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 from .database import Database, Download, Paper
 from .paths import build_pdf_path, is_non_downloadable_paper
-from .scihub import SciHubClient
+from .scihub import SciHubClient, download_papers
 
 
 FILE_EXISTS_SKIPPED = "File already exists (skipped)"
@@ -892,39 +892,16 @@ def retry_failed_downloads(
     Returns:
         Statistics dictionary
     """
-    # Get failed downloads
     downloads = db.list_downloads(status='failed', limit=limit)
-    
-    stats = {
-        'retried': len(downloads),
-        'now_success': 0,
-        'still_failed': 0,
+    dois = [paper.doi for _, paper in downloads if paper.doi]
+    retry_stats = download_papers(db, client, dois, output_dir, force=False)
+
+    return {
+        'retried': len(dois),
+        'now_success': retry_stats['success'],
+        'still_failed': retry_stats['failed'],
+        'skipped': retry_stats['skipped'],
     }
-    
-    for download, paper in tqdm(downloads, desc="Retrying"):
-        output_path = build_pdf_path(db, output_dir, paper)
-        
-        # Retry download
-        result = client.download(paper.doi, output_path, force=True)
-        
-        # Update database
-        download.status = 'success' if result.success else 'failed'
-        download.file_path = str(output_path.relative_to(client.config.data_dir)) if result.success and output_path.exists() else None
-        download.file_size = result.file_size
-        download.sha256 = result.sha256
-        download.mirror = result.mirror
-        download.completed_at = datetime.now() if result.success else None
-        download.error_message = result.error_message
-        download.response_time_ms = result.response_time_ms
-        
-        db.update_download(download)
-        
-        if result.success:
-            stats['now_success'] += 1
-        else:
-            stats['still_failed'] += 1
-    
-    return stats
 
 
 def _pdf_header_is_valid(file_path: Path) -> bool:

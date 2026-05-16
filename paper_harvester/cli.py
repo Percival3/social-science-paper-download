@@ -694,6 +694,8 @@ def retry_failed(ctx, limit):
     
     click.echo(f"✓ Retried: {stats['retried']}")
     click.echo(f"✓ Now successful: {stats['now_success']}")
+    if stats.get('skipped'):
+        click.echo(f"✓ Skipped: {stats['skipped']}")
     click.echo(f"✗ Still failed: {stats['still_failed']}")
 
 
