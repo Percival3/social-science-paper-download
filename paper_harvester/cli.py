@@ -10,7 +10,7 @@ import click
 from tqdm import tqdm
 
 from .config import load_config, validate_config, Config
-from .database import Database
+from .database import Database, Journal, Paper
 from .files import import_pdf_files, extract_text_from_pdfs
 from .journals import (
     import_journals_from_directory,
@@ -18,7 +18,13 @@ from .journals import (
     list_journals,
     get_journal_stats,
 )
-from .crossref import CrossrefClient, discover_papers_for_journal, discover_papers_for_platform
+from .crossref import (
+    CrossrefClient,
+    discover_papers_for_journal,
+    discover_papers_for_platform,
+    get_source_rule_for_doi,
+)
+from .official_sources.nber import get_paper_metadata_by_doi as get_nber_paper_metadata_by_doi
 from .scihub import SciHubClient, download_papers
 from .reports import (
     generate_report,
@@ -39,6 +45,97 @@ def get_db_and_config(ctx) -> tuple[Database, Config]:
     config = ctx.obj['config']
     db = Database(config.db_path)
     return db, config
+
+
+def _ensure_source_journal(db: Database, source_rule: dict) -> None:
+    """Create a minimal journal row for direct DOI downloads from known sources."""
+    journal_id = source_rule.get("journal_id")
+    if not journal_id or db.get_journal(journal_id):
+        return
+
+    db.insert_journal(
+        Journal(
+            journal_id=journal_id,
+            title=source_rule.get("title") or journal_id,
+            source_id=source_rule.get("source_id"),
+            publisher=source_rule.get("publisher"),
+            issn=source_rule.get("issn"),
+        )
+    )
+
+
+def _hydrate_missing_download_metadata(db: Database, config: Config, dois: list[str]) -> int:
+    """Fetch missing metadata for direct DOI downloads so paths are named well."""
+    client: Optional[CrossrefClient] = None
+    imported = 0
+
+    for doi in dois:
+        normalized_doi = doi.strip().lower()
+        source_rule = get_source_rule_for_doi(normalized_doi)
+        existing_paper = db.get_paper(normalized_doi)
+        if existing_paper and not source_rule:
+            continue
+        if (
+            existing_paper
+            and source_rule
+            and existing_paper.journal_id == source_rule.get("journal_id")
+            and existing_paper.title
+            and existing_paper.published_year
+        ):
+            continue
+
+        if source_rule:
+            _ensure_source_journal(db, source_rule)
+
+        paper: Optional[Paper] = None
+        try:
+            client = client or CrossrefClient(config)
+            paper = client.get_work_by_doi(normalized_doi)
+        except Exception as e:
+            db.insert_log(
+                action='metadata_lookup',
+                status='fail',
+                doi=normalized_doi,
+                message=f"Crossref DOI metadata lookup failed: {str(e)}",
+            )
+
+        if paper is None and existing_paper:
+            paper = existing_paper
+
+        if paper:
+            if source_rule:
+                paper.journal_id = source_rule.get("journal_id")
+        if (
+            source_rule
+            and source_rule.get("journal_id") == "nber_working_paper"
+            and (not paper or not (paper.title and paper.published_year))
+        ):
+            official_paper = get_nber_paper_metadata_by_doi(config, normalized_doi)
+            if official_paper:
+                if paper:
+                    paper.title = paper.title or official_paper.title
+                    paper.published_year = paper.published_year or official_paper.published_year
+                    paper.published_date = paper.published_date or official_paper.published_date
+                    paper.authors = paper.authors or official_paper.authors
+                    paper.crossref_raw = paper.crossref_raw or official_paper.crossref_raw
+                else:
+                    paper = official_paper
+
+        if paper:
+            if source_rule:
+                paper.journal_id = source_rule.get("journal_id")
+            db.insert_paper(paper)
+            imported += 1
+        elif source_rule:
+            db.insert_paper(
+                Paper(
+                    doi=normalized_doi,
+                    journal_id=source_rule.get("journal_id"),
+                )
+            )
+            imported += 1
+
+    return imported
 
 
 # =============================================================================
@@ -249,8 +346,30 @@ def discover(ctx, journal_id, platform, discover_all, from_year, until_year, dry
 @click.option('--mirror', '-m', help='Use specific mirror URL')
 @click.option('--force', is_flag=True, help='Re-download existing files')
 @click.option('--official-only', is_flag=True, help='Use official source rules only; do not fall back to Sci-Hub')
+@click.option('--browser-assist', is_flag=True, help='Use your normal browser as a batch SSRN PDF download assist before Sci-Hub fallback')
+@click.option(
+    '--browser-download-dir',
+    type=click.Path(exists=True, file_okay=False),
+    help='Directory where the browser saves PDFs (defaults to ~/Downloads)',
+)
+@click.option('--browser-timeout', type=int, default=180, show_default=True, help='Seconds to wait for browser-assisted PDF')
 @click.pass_context
-def download(ctx, journal_id, platform, single_doi, doi_file, from_year, until_year, limit, mirror, force, official_only):
+def download(
+    ctx,
+    journal_id,
+    platform,
+    single_doi,
+    doi_file,
+    from_year,
+    until_year,
+    limit,
+    mirror,
+    force,
+    official_only,
+    browser_assist,
+    browser_download_dir,
+    browser_timeout,
+):
     """Download papers from Sci-Hub."""
     db, config = get_db_and_config(ctx)
     
@@ -303,6 +422,11 @@ def download(ctx, journal_id, platform, single_doi, doi_file, from_year, until_y
     if not dois:
         click.echo("No papers to download. Run 'discover' first or check filters.")
         return
+
+    dois = [doi.strip().lower() for doi in dois if doi.strip()]
+    imported_metadata = _hydrate_missing_download_metadata(db, config, dois)
+    if imported_metadata:
+        click.echo(f"✓ Added metadata for {imported_metadata} direct DOI(s)")
     
     click.echo(f"Preparing to download {len(dois)} paper(s)...")
     
@@ -323,6 +447,9 @@ def download(ctx, journal_id, platform, single_doi, doi_file, from_year, until_y
             preferred_mirror=mirror,
             skip_year_after_failed_volume=skip_year_after_failed_volume,
             official_only=official_only,
+            browser_assist=browser_assist,
+            browser_download_dir=Path(browser_download_dir) if browser_download_dir else None,
+            browser_timeout=browser_timeout,
             progress_callback=progress_callback,
         )
     

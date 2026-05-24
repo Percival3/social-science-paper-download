@@ -19,8 +19,6 @@ NON_DOWNLOAD_MAIN_TITLES = {
     "appendix a",
     "back matter",
     "bibliography",
-    "book review",
-    "book reviews",
     "conclusion",
     "conclusions",
     "contents",
@@ -38,6 +36,19 @@ NON_DOWNLOAD_MAIN_TITLES = {
     "preface",
     "references",
     "table of contents",
+}
+BOOK_REVIEW_MAIN_TITLES = {
+    "book review",
+    "book reviews",
+}
+BOOK_REVIEW_DOWNLOAD_JOURNAL_IDS = {
+    "jeh",
+    "eeh",
+    "ehr",
+    "journal_of_economic_history",
+    "the_journal_of_economic_history",
+    "explorations_in_economic_history",
+    "economic_history_review",
 }
 NON_DOWNLOAD_METADATA_TYPES = {
     "book review",
@@ -94,11 +105,21 @@ def normalized_main_title(value: Optional[str]) -> str:
 
 def is_non_downloadable_title(value: Optional[str]) -> bool:
     """Return whether a title represents front matter, reviews, or corrections."""
+    return _is_non_downloadable_title(value, include_book_reviews=True)
+
+
+def _is_non_downloadable_title(
+    value: Optional[str],
+    *,
+    include_book_reviews: bool,
+) -> bool:
+    """Return whether a title should be skipped, with optional review retention."""
     title = normalized_main_title(value)
     title_without_space = re.sub(r"\s+", "", title)
 
     return (
         title in NON_DOWNLOAD_MAIN_TITLES
+        or (include_book_reviews and title in BOOK_REVIEW_MAIN_TITLES)
         or title_without_space in {"frontmatter", "backmatter"}
         or title.startswith("appendix")
         or bool(re.fullmatch(r"\d+\s+introduction", title))
@@ -193,12 +214,22 @@ def _looks_like_book_review_title(value: Optional[str], pages: Optional[str]) ->
     return count is None or count <= 5
 
 
+def _retains_book_reviews(paper: Paper) -> bool:
+    """Return whether the journal scope explicitly keeps book reviews."""
+    journal_id = (paper.journal_id or "").strip().casefold()
+    return journal_id in BOOK_REVIEW_DOWNLOAD_JOURNAL_IDS
+
+
 def is_non_downloadable_paper(paper: Paper) -> bool:
     """Return whether a paper record should be skipped before PDF download."""
+    retain_book_reviews = _retains_book_reviews(paper)
     return (
-        is_non_downloadable_title(paper.title)
-        or _metadata_declares_non_downloadable(paper)
-        or _looks_like_book_review_title(paper.title, paper.pages)
+        _is_non_downloadable_title(
+            paper.title,
+            include_book_reviews=not retain_book_reviews,
+        )
+        or (not retain_book_reviews and _metadata_declares_non_downloadable(paper))
+        or (not retain_book_reviews and _looks_like_book_review_title(paper.title, paper.pages))
     )
 
 

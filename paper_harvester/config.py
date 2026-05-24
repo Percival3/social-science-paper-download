@@ -30,6 +30,7 @@ class Config:
         "Chrome/124.0 Safari/537.36"
     )
     nber_cookie: Optional[str] = None
+    ssrn_cookie: Optional[str] = None
     
     # System
     data_dir: Path = field(default_factory=lambda: Path("data"))
@@ -150,6 +151,7 @@ def load_config(env_file: Optional[str] = None) -> Config:
             ),
         ),
         nber_cookie=os.getenv("NBER_COOKIE") or None,
+        ssrn_cookie=os.getenv("SSRN_COOKIE") or None,
         data_dir=Path(os.getenv("DATA_DIR", "data")),
         requests_per_minute=int(os.getenv("REQUESTS_PER_MINUTE", "10")),
         concurrent_downloads=int(os.getenv("CONCURRENT_DOWNLOADS", "3")),

@@ -3,8 +3,11 @@ Crossref API integration for DOI discovery.
 """
 import json
 import re
+import shutil
+import subprocess
 import time
 from typing import List, Optional, Dict, Any, Iterator
+from urllib.parse import quote
 import httpx
 
 from .config import Config
@@ -13,13 +16,47 @@ from .database import Database, Paper
 
 CROSSREF_API_BASE = "https://api.crossref.org"
 
-CROSSREF_NON_JOURNAL_RULES = {
+CROSSREF_SOURCE_RULES: Dict[str, Dict[str, Any]] = {
     # Crossref stores NBER working papers as report records under the NBER DOI
     # prefix, without ISSN or container-title metadata.
-    "nber working paper": {"prefix": "10.3386", "type": "report"},
-    "nber working papers": {"prefix": "10.3386", "type": "report"},
-    "nber working paper series": {"prefix": "10.3386", "type": "report"},
+    "nber working paper": {
+        "journal_id": "nber_working_paper",
+        "title": "NBER Working Paper",
+        "source_id": 226,
+        "publisher": "工作论文",
+        "prefix": "10.3386",
+        "type": "report",
+    },
+    "nber working papers": {
+        "journal_id": "nber_working_paper",
+        "title": "NBER Working Paper",
+        "source_id": 226,
+        "publisher": "工作论文",
+        "prefix": "10.3386",
+        "type": "report",
+    },
+    "nber working paper series": {
+        "journal_id": "nber_working_paper",
+        "title": "NBER Working Paper",
+        "source_id": 226,
+        "publisher": "工作论文",
+        "prefix": "10.3386",
+        "type": "report",
+    },
+    # SSRN research papers are registered as SSRN Electronic Journal items.
+    "ssrn": {
+        "journal_id": "ssrn",
+        "title": "SSRN",
+        "source_id": 227,
+        "publisher": "工作论文",
+        "issn": "1556-5068",
+        "prefix": "10.2139",
+        "type": "journal-article",
+    },
 }
+
+NBER_SOURCE_DOI = re.compile(r"^10\.3386/[wth]\d+$", re.IGNORECASE)
+SSRN_SOURCE_DOI = re.compile(r"^10\.2139/ssrn\.\d+$", re.IGNORECASE)
 
 
 def normalize_journal_title(title: Optional[str]) -> str:
@@ -30,6 +67,132 @@ def normalize_journal_title(title: Optional[str]) -> str:
     title = title.replace("&", "and")
     title = re.sub(r"[^a-z0-9]+", " ", title.lower())
     return re.sub(r"\s+", " ", title).strip()
+
+
+def normalize_journal_title_for_issn_resolution(title: Optional[str]) -> str:
+    """Normalize title variants that Crossref journal search commonly returns."""
+    normalized = normalize_journal_title(title)
+    return re.sub(r"^(the|a|an)\s+", "", normalized)
+
+
+def journal_title_query_variants(title: str) -> List[str]:
+    """Build conservative Crossref journal-search variants for local title quirks."""
+    variants: List[str] = []
+    bases: List[str] = []
+
+    def add(values: List[str], value: str) -> None:
+        value = re.sub(r"\s+", " ", value).strip(" ,:;")
+        if value and value not in values:
+            values.append(value)
+
+    parenthetical_stripped = re.sub(r"\([^)]*\)", "", title)
+    add(bases, title)
+    add(bases, parenthetical_stripped)
+    add(bases, parenthetical_stripped.replace("(", "").replace(")", ""))
+
+    for base in bases:
+        candidates = [
+            base,
+            base.replace(" : ", ": "),
+            base.replace("&", "and"),
+            base.replace("&", "and").replace(" : ", ": "),
+        ]
+        if " and " in base:
+            candidates.extend([
+                base.replace(" and ", " & "),
+                base.replace(" and ", " & ").replace(" : ", ": "),
+            ])
+
+        for candidate in candidates:
+            add(variants, candidate)
+            if not normalize_journal_title(candidate).startswith(("the ", "a ", "an ")):
+                add(variants, f"The {candidate}")
+
+        add(variants, re.sub(r"[^A-Za-z0-9&]+", " ", base).replace("&", "and"))
+
+    return variants
+
+
+def crossref_journal_title_candidates(title: Optional[str]) -> List[str]:
+    """Return normalized exact-match candidates for Crossref journal titles."""
+    if not title:
+        return []
+
+    candidates: List[str] = []
+    values = [title]
+    values.extend(re.split(r"/", re.sub(r"\([^)]*\)", "", title)))
+
+    for value in values:
+        normalized = normalize_journal_title_for_issn_resolution(value)
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+
+    return candidates
+
+
+MANUAL_JOURNAL_ISSNS: Dict[str, List[str]] = {
+    normalize_journal_title_for_issn_resolution("B E Journal of Economic Analysis & Policy"): [
+        "2194-6108",
+        "1935-1682",
+        "1538-0637",
+    ],
+    normalize_journal_title_for_issn_resolution("Economic Modeling"): ["0264-9993"],
+    normalize_journal_title_for_issn_resolution("Economic Modelling"): ["0264-9993"],
+    normalize_journal_title_for_issn_resolution("Econonmics of Education Review"): ["0272-7757"],
+    normalize_journal_title_for_issn_resolution("Economics of Education Review"): ["0272-7757"],
+    normalize_journal_title_for_issn_resolution("Journal of Banking and Finance"): ["0378-4266"],
+    normalize_journal_title_for_issn_resolution("Journal of Banking & Finance"): ["0378-4266"],
+    normalize_journal_title_for_issn_resolution("Journal of Economic Behavior and Organization"): ["0167-2681"],
+    normalize_journal_title_for_issn_resolution("Journal of Economic Behavior & Organization"): ["0167-2681"],
+    normalize_journal_title_for_issn_resolution("Journal of Economics and Management Strategy"): [
+        "1058-6407",
+        "1530-9134",
+    ],
+    normalize_journal_title_for_issn_resolution("Journal of Economics & Management Strategy"): [
+        "1058-6407",
+        "1530-9134",
+    ],
+    normalize_journal_title_for_issn_resolution("Journal of Institutions and Theoretical Economics"): [
+        "0932-4569",
+    ],
+    normalize_journal_title_for_issn_resolution("Journal of Institutional and Theoretical Economics JITE"): [
+        "0932-4569",
+    ],
+    normalize_journal_title_for_issn_resolution("Journal of Public Budgeting, Accounting & Financial Management"): [
+        "1096-3367",
+        "1945-1814",
+    ],
+    normalize_journal_title_for_issn_resolution("Journal of Risk and Insurance"): [
+        "0022-4367",
+        "1539-6975",
+    ],
+    normalize_journal_title_for_issn_resolution("Journal of Risk & Insurance"): [
+        "0022-4367",
+        "1539-6975",
+    ],
+    normalize_journal_title_for_issn_resolution("Labor Economics"): ["0927-5371"],
+    normalize_journal_title_for_issn_resolution("Labour Economics"): ["0927-5371"],
+    normalize_journal_title_for_issn_resolution("Public Performance & Management Review"): [
+        "1530-9576",
+        "1557-9271",
+    ],
+    normalize_journal_title_for_issn_resolution("Review of Environment Economics and Policy"): [
+        "1750-6816",
+        "1750-6824",
+    ],
+    normalize_journal_title_for_issn_resolution("Review of Environmental Economics and Policy"): [
+        "1750-6816",
+        "1750-6824",
+    ],
+    normalize_journal_title_for_issn_resolution("Social Science & Medicine"): ["0277-9536"],
+    normalize_journal_title_for_issn_resolution("Social Science & Medicine (SSM)"): ["0277-9536"],
+    normalize_journal_title_for_issn_resolution("Social Science and Medicine"): ["0277-9536"],
+}
+
+
+def get_manual_journal_issns(journal_title: str) -> List[str]:
+    """Return manually verified ISSNs for known local title variants."""
+    return list(MANUAL_JOURNAL_ISSNS.get(normalize_journal_title_for_issn_resolution(journal_title), []))
 
 
 def crossref_item_matches_journal(item: Dict[str, Any], journal_title: Optional[str]) -> bool:
@@ -46,9 +209,23 @@ def crossref_item_matches_journal(item: Dict[str, Any], journal_title: Optional[
     return False
 
 
-def get_non_journal_rule(title: Optional[str]) -> Optional[Dict[str, str]]:
-    """Return a Crossref rule for serial sources that are not journal records."""
-    return CROSSREF_NON_JOURNAL_RULES.get(normalize_journal_title(title))
+def get_source_rule(title: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Return a Crossref discovery rule for supported special sources."""
+    return CROSSREF_SOURCE_RULES.get(normalize_journal_title(title))
+
+
+def get_source_rule_for_doi(doi: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Return the special-source metadata rule for a supported DOI."""
+    if not doi:
+        return None
+
+    normalized_doi = doi.strip().lower()
+    if SSRN_SOURCE_DOI.match(normalized_doi):
+        return CROSSREF_SOURCE_RULES["ssrn"]
+    if NBER_SOURCE_DOI.match(normalized_doi):
+        return CROSSREF_SOURCE_RULES["nber working paper"]
+
+    return None
 
 
 def build_crossref_query(
@@ -132,8 +309,16 @@ def parse_crossref_item(item: Dict[str, Any]) -> Optional[Paper]:
                 author_info['orcid'] = author['ORCID']
             authors.append(author_info)
         
-        # Extract publication date
-        published = item.get('published-print', item.get('published-online', {}))
+        # Extract publication date. SSRN and other non-standard records may
+        # use issued/published rather than published-print/online.
+        published = (
+            item.get('published-print')
+            or item.get('published-online')
+            or item.get('published')
+            or item.get('published-other')
+            or item.get('issued')
+            or {}
+        )
         date_parts = published.get('date-parts', [[]])[0] if published else []
         
         year = None
@@ -224,7 +409,7 @@ class CrossrefClient:
             'offset': offset,
             'sort': 'published-print',
             'order': 'desc',
-            'select': 'DOI,title,author,container-title,published-print,published-online,volume,issue,page,abstract,type,ISSN',
+            'select': 'DOI,title,author,container-title,published-print,published-online,issued,volume,issue,page,abstract,type,ISSN',
         }
         if query:
             params['query.container-title'] = query
@@ -257,19 +442,94 @@ class CrossrefClient:
 
     def resolve_journal_issns(self, journal_title: str) -> List[str]:
         """Resolve ISSNs from a journal title using Crossref's journal index."""
-        response = self.search_journals(journal_title, rows=10)
-        expected = normalize_journal_title(journal_title)
-        issns: List[str] = []
+        manual_issns = get_manual_journal_issns(journal_title)
+        if manual_issns:
+            return manual_issns
 
-        for item in response.get('message', {}).get('items', []):
-            if normalize_journal_title(item.get('title')) != expected:
+        expected = normalize_journal_title_for_issn_resolution(journal_title)
+        issns: List[str] = []
+        last_error: Optional[Exception] = None
+        had_response = False
+
+        for query in journal_title_query_variants(journal_title):
+            try:
+                response = self.search_journals(query, rows=10)
+                had_response = True
+            except Exception as e:
+                last_error = e
                 continue
 
-            for issn in item.get('ISSN', []):
-                if issn and issn not in issns:
-                    issns.append(issn)
+            for item in response.get('message', {}).get('items', []):
+                if expected not in crossref_journal_title_candidates(item.get('title')):
+                    continue
+
+                for issn in item.get('ISSN', []):
+                    if issn and issn not in issns:
+                        issns.append(issn)
+
+                if issns:
+                    return issns
+
+        if not had_response and last_error:
+            raise last_error
 
         return issns
+
+    def get_work_by_doi(self, doi: str) -> Optional[Paper]:
+        """Fetch one Crossref work by DOI and parse it into a Paper."""
+        self._rate_limit()
+
+        url = f"{CROSSREF_API_BASE}/works/{quote(doi.strip(), safe='')}"
+        last_error: Optional[Exception] = None
+        try:
+            with httpx.Client(headers=self.headers, timeout=30) as client:
+                response = client.get(url)
+                if response.status_code == 404:
+                    return None
+                response.raise_for_status()
+
+            data = response.json()
+        except Exception as e:
+            last_error = e
+            data = self._get_json_with_curl(url)
+            if data is None:
+                raise last_error
+
+        return parse_crossref_item(data.get('message', {}))
+
+    def _get_json_with_curl(self, url: str) -> Optional[Dict[str, Any]]:
+        """Fetch JSON with system curl when Python TLS/networking is blocked."""
+        curl_path = shutil.which("curl.exe") or shutil.which("curl")
+        if not curl_path:
+            return None
+
+        args = [
+            curl_path,
+            "-L",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "30",
+            "-H",
+            f"User-Agent: {self.config.user_agent}",
+            "-H",
+            f"mailto: {self.config.crossref_mailto}",
+            url,
+        ]
+        completed = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=40,
+            check=False,
+        )
+        if completed.returncode != 0:
+            return None
+
+        return json.loads(completed.stdout)
     
     def get_all_works(
         self,
@@ -368,33 +628,38 @@ def discover_papers_for_journal(
     
     # Build query. If the source spreadsheet has no ISSN, resolve it from
     # Crossref by exact journal title before falling back to title search.
-    # Some serial sources in the spreadsheet are reports rather than journals;
-    # those need source-specific Crossref filters instead of container titles.
-    issn = journal.issn or journal.eissn
-    non_journal_rule = get_non_journal_rule(journal.title)
-    if not issn and not non_journal_rule:
+    # Some sources in the spreadsheet need source-specific Crossref filters
+    # instead of title search, such as NBER reports or SSRN research papers.
+    source_rule = get_source_rule(journal.title)
+    issn = journal.issn or journal.eissn or (source_rule.get("issn") if source_rule else None)
+    if not issn and not source_rule:
         resolved_issns = client.resolve_journal_issns(journal.title)
         if resolved_issns:
             issn = resolved_issns[0]
+            if not dry_run:
+                journal.issn = journal.issn or resolved_issns[0]
+                if len(resolved_issns) > 1:
+                    journal.eissn = journal.eissn or resolved_issns[1]
+                db.update_journal_issns(journal.journal_id, journal.issn, journal.eissn)
 
     query = build_crossref_query(
         issn=issn,
         from_year=from_year,
         until_year=until_year,
-        journal_title=journal.title if not issn and not non_journal_rule else None,
+        journal_title=journal.title if not issn and not source_rule else None,
     )
     # Crossref's type filter keeps regular journal discovery away from
     # non-journal works, but publisher book reviews may still be registered as
     # journal-article and must be handled by the download classification layer.
-    work_type = non_journal_rule.get("type") if non_journal_rule else "journal-article"
+    work_type = source_rule.get("type") if source_rule else "journal-article"
     filters = build_crossref_filters(
         issn=issn,
         from_year=from_year,
         until_year=until_year,
-        doi_prefix=non_journal_rule.get("prefix") if non_journal_rule else None,
+        doi_prefix=source_rule.get("prefix") if source_rule else None,
         work_type=work_type,
     )
-    expected_journal_title = None if issn or non_journal_rule else journal.title
+    expected_journal_title = None if issn or source_rule else journal.title
     
     if dry_run:
         try:

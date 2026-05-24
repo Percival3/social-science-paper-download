@@ -43,7 +43,7 @@
 - `uchicago_journals_9.xlsx` - University of Chicago Press
 - `uwpress_journals_2.xlsx` - University of Wisconsin Press（Land Economics、JHR）
 - `wiley_journals_50.xlsx` - Wiley 出版
-- `working_papers_1.xlsx` - 工作论文（如 NBER Working Paper）
+- `working_papers_*.xlsx` - 工作论文（如 NBER Working Paper、SSRN）
 
 代码实现时应支持列名容错，例如 `journal`, `title`, `期刊名`, `ISSN`, `eISSN`, `publisher`, `platform`, `discipline` 等常见列名。
 
@@ -97,6 +97,9 @@ SCIHUB_MIRRORS=https://sci-hub.al,https://sci-hub.se,https://sci-hub.st,https://
 SCIHUB_TIMEOUT=30                    # 单次请求超时（秒）
 SCIHUB_RETRY=3                       # 单镜像失败后的重试次数
 SCIHUB_MIRROR_COOLDOWN=300           # 镜像失效后的冷却时间（秒）
+OFFICIAL_USER_AGENT=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36
+NBER_COOKIE=                         # 可选：NBER 浏览器会话 cookie
+SSRN_COOKIE=                         # 可选：SSRN 公开下载失败后的二次尝试 cookie
 
 # 系统配置
 DATA_DIR=data                        # 数据根目录
@@ -268,20 +271,30 @@ paper-harvester download --journal-id ... --mirror https://sci-hub.se
 
 当前下载后端为 Sci-Hub 镜像解析与 PDF 直链下载；后续如果更换下载方式，建议保留 `download_papers` 的输入输出契约，即 DOI 列表、输出目录、成功/失败统计和 `downloads` 表记录。
 
-工作论文类来源会优先尝试官方 PDF。目前期刊清单中识别到的工作论文来源为 `NBER Working Paper`；其 DOI 形如 `10.3386/w15630`，下载时先尝试 `https://www.nber.org/papers/w15630.pdf`，成功记录 `mirror=nber-official`，失败后再回落到 Sci-Hub 镜像。
+工作论文类来源会优先尝试官方 PDF。目前识别到的官方源包括 `NBER Working Paper` 和 `SSRN`。NBER DOI 形如 `10.3386/w15630`，下载时先尝试 `https://www.nber.org/papers/w15630.pdf`，成功记录 `mirror=nber-official`；SSRN DOI 形如 `10.2139/ssrn.2269040`，下载时先打开 SSRN abstract 页并解析 `Delivery.cfm` PDF 链接，成功记录 `mirror=ssrn-official`。官方源失败后，默认再回落到 Sci-Hub 镜像。
 
 如果需要批量稳定测试 NBER 官方源，可以使用 `--official-only` 禁止回落到 Sci-Hub：
 
 ```powershell
 paper-harvester download --journal-id nber_working_paper --from-year 2010 --until-year 2010 --official-only
 paper-harvester download --doi 10.3386/w15630 --official-only --force
+paper-harvester download --journal-id ssrn --from-year 2013 --until-year 2013 --official-only
+paper-harvester download --doi 10.2139/ssrn.2269040 --official-only --force
 ```
 
-官方源下载支持 `.env` 中的 `OFFICIAL_USER_AGENT` 和 `NBER_COOKIE`。如果本机直接请求 NBER 返回 403，可先在浏览器或机构网络中打开 NBER，再把必要 cookie 填入 `NBER_COOKIE`，或配置 `HTTP_PROXY` / `HTTPS_PROXY` 后重试。`--official-only` 模式下官方源失败会写入失败记录，不会混入 Sci-Hub 成功结果。
+官方源下载支持 `.env` 中的 `OFFICIAL_USER_AGENT`、`NBER_COOKIE` 和 `SSRN_COOKIE`。如果本机直接请求 NBER 返回 403，可先在浏览器或机构网络中打开 NBER，再把必要 cookie 填入 `NBER_COOKIE`。SSRN 会先尝试无需登录的公开 PDF；公开下载失败且配置了 `SSRN_COOKIE` 时，才会带 cookie 再试一次。仍失败时，如果没有使用 `--official-only`，会继续回落到 Sci-Hub；`--official-only` 模式下官方源失败会写入失败记录，不会混入 Sci-Hub 成功结果。
+
+如果 SSRN 命令行访问被 Cloudflare 或浏览器验证拦住，可以使用浏览器辅助模式。启用 `--browser-assist` 时，SSRN 不再先走命令行脚本请求，而是直接用你的默认浏览器一次性打开本批次的 SSRN abstract 页；你在正常浏览器里完成验证并点击 SSRN 下载按钮，程序会监控浏览器下载目录，把新下载的 PDF 校验后移动到统一的 `DATA_DIR/fulltext/pdf/...` 路径。若浏览器下载文件名不含 SSRN abstract id，请按打开的标签页顺序点击下载，程序会按下载完成顺序归档。
+
+```powershell
+paper-harvester download --doi 10.2139/ssrn.2269040 --browser-assist --official-only --force
+paper-harvester download --journal-id ssrn --from-year 2013 --until-year 2013 --browser-assist --browser-timeout 300
+paper-harvester download --journal-id ssrn --from-year 2013 --until-year 2013 --browser-assist --browser-download-dir "$env:USERPROFILE\Downloads"
+```
 
 当前 PDF 下载代码主要作为练习版后端：
 
-1. `SciHubClient.download()` 负责从 DOI 找到 PDF 直链；工作论文 DOI 会先尝试官方源。
+1. `SciHubClient.download()` 保持现有命令入口和普通 DOI 行为；普通 DOI 直接进入 Sci-Hub，特殊 DOI 先经 `official_sources` 分发。NBER 官方下载已拆到 `paper_harvester/official_sources/nber.py`，SSRN 仍按 SSRN 官方/辅助链路处理。
 2. `SciHubClient._download_pdf()` 负责把 PDF 流式写入 `.part` 临时文件，校验大小和 `%PDF` 文件头后再保存为最终文件。
 3. `paper_harvester.paths.build_pdf_path()` 负责生成 `{期刊全名}/{年份}/{issue三位}/{CODE}_{主标题}.pdf` 保存路径，其中 `CODE` 为 `{期刊ID三位}{年份四位}{volume四位}{issue三位}`。
 4. `download_papers()` 负责批量调度、写入 `downloads` 表；同 DOI 已成功会跳过，不同 DOI 撞到同一基础文件名时会自动使用 `_02`、`_03` 等后缀保存；非论文主标题会直接跳过。

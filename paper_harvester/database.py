@@ -293,6 +293,32 @@ class Database:
                 journal.source_file,
                 journal.raw_columns,
             ))
+
+    def update_journal_issns(
+        self,
+        journal_id: str,
+        issn: Optional[str] = None,
+        eissn: Optional[str] = None,
+    ) -> None:
+        """Update only the cached Crossref ISSNs for an existing journal row."""
+        assignments = []
+        params: List[str] = []
+
+        if issn:
+            assignments.append("issn = ?")
+            params.append(issn)
+        if eissn:
+            assignments.append("eissn = ?")
+            params.append(eissn)
+        if not assignments:
+            return
+
+        params.append(journal_id)
+        with self._get_connection() as conn:
+            conn.execute(
+                f"UPDATE journals SET {', '.join(assignments)} WHERE journal_id = ?",
+                params,
+            )
     
     def get_journal(self, journal_id: str) -> Optional[Journal]:
         """Get a journal by ID."""
